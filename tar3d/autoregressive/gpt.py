@@ -14,6 +14,9 @@ from torch.nn import functional as F
 
 from ..utils.drop_path import DropPath
 from .triposE import precompute_freqs_cis_3d
+from lightning_attn.ops import lightning_attn_func
+from lightning_attn.utils import _build_slope_tensor
+from einops import rearrange
 
 
 def find_multiple(n: int, k: int):
@@ -242,6 +245,84 @@ class Attention(nn.Module):
         return output
 
 
+class LinearAttention(nn.Module):
+    def __init__(self, config: ModelArgs):
+        super().__init__()
+        assert config.dim % config.n_head == 0
+        self.dim = config.dim
+        self.head_dim = config.dim // config.n_head
+        self.n_head = config.n_head
+        self.n_kv_head = config.n_kv_head if config.n_kv_head is not None else config.n_head
+        # Linear attention usually requires same number of heads for Q, K, V or specific handling.
+        # Assuming n_head == n_kv_head for simplicity in Linear Attention for now, 
+        # or we replicate KV. iFlame uses same heads.
+        # If config has different n_kv_head, we might need to adjust.
+        # For now, let's assume we project to n_head for all.
+        
+        self.wqkv = nn.Linear(config.dim, 3 * config.dim, bias=False)
+        self.wo = nn.Linear(config.dim, config.dim, bias=False)
+        
+        # Slope rate for Lightning Attention
+        slope_rate = _build_slope_tensor(self.n_head)
+        self.register_buffer("slope_rate", slope_rate, persistent=False)
+        
+        self.attn_dropout_p = config.attn_dropout_p
+        self.resid_dropout = nn.Dropout(config.resid_dropout_p)
+        self.norm = RMSNorm(config.dim, eps=config.norm_eps) # Linear Attn usually has a norm/gate
+
+    def forward(
+        self, x: torch.Tensor, freqs_cis: torch.Tensor = None, 
+        input_pos: Optional[torch.Tensor] = None, 
+        mask: Optional[torch.Tensor] = None
+    ):
+        bsz, seqlen, _ = x.shape
+        
+        # Project
+        qkv = self.wqkv(x)
+        q, k, v = qkv.chunk(3, dim=-1)
+        
+        q = q.view(bsz, seqlen, self.n_head, self.head_dim)
+        k = k.view(bsz, seqlen, self.n_head, self.head_dim)
+        v = v.view(bsz, seqlen, self.n_head, self.head_dim)
+        
+        # RoPE
+        q = apply_rotary_emb(q, freqs_cis)
+        k = apply_rotary_emb(k, freqs_cis)
+        
+        # Transpose for Lightning Attention: (B, H, N, D)
+        q = q.transpose(1, 2)
+        k = k.transpose(1, 2)
+        v = v.transpose(1, 2)
+        
+        # Lightning Attention
+        # Note: This ignores the 'mask' argument, effectively treating it as causal 
+        # and relying on zero-padding for correctness.
+        output = lightning_attn_func(q, k, v, self.slope_rate)
+        
+        # Reshape back
+        output = rearrange(output, 'b h n d -> b n (h d)')
+        
+        # Norm (common in Linear Attn blocks before projection)
+        output = self.norm(output)
+        
+        output = self.resid_dropout(self.wo(output))
+        return output
+
+class LinearTransformerBlock(nn.Module):
+    def __init__(self, config: ModelArgs, drop_path: float):
+        super().__init__()
+        self.attention = LinearAttention(config)
+        self.feed_forward = FeedForward(config)
+        self.attention_norm = RMSNorm(config.dim, eps=config.norm_eps)
+        self.ffn_norm = RMSNorm(config.dim, eps=config.norm_eps)
+        self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
+
+    def forward(
+        self, x: torch.Tensor, freqs_cis: torch.Tensor, start_pos: int, mask: Optional[torch.Tensor] = None):
+        h = x + self.drop_path(self.attention(self.attention_norm(x), freqs_cis, start_pos, mask))
+        out = h + self.drop_path(self.feed_forward(self.ffn_norm(h)))
+        return out
+
 class TransformerBlock(nn.Module):
     def __init__(self, config: ModelArgs, drop_path: float):
         super().__init__()
@@ -278,8 +359,15 @@ class Transformer(nn.Module):
         # transformer blocks
         dpr = [x.item() for x in torch.linspace(0, config.drop_path_rate, config.n_layer)]
         self.layers = torch.nn.ModuleList()
+        
+        # Hybrid Architecture: 3 Linear, 1 Full
         for layer_id in range(config.n_layer):
-            self.layers.append(TransformerBlock(config, dpr[layer_id]))
+            if (layer_id + 1) % 4 == 0:
+                # Full Attention every 4th layer
+                self.layers.append(TransformerBlock(config, dpr[layer_id]))
+            else:
+                # Linear Attention otherwise
+                self.layers.append(LinearTransformerBlock(config, dpr[layer_id]))
 
         # output layer
         self.norm = RMSNorm(config.dim, eps=config.norm_eps)

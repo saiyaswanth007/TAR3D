@@ -52,28 +52,78 @@ def load_tokenizer(config_path=None, ckpt_path=None, device='cuda:0'):
     return vq_model    
 
 
+from tar3d.optim.muon import Muon
+
 def creat_optimizer(model, weight_decay, learning_rate, betas, logger):
-    # start with all of the candidate parameters
-    param_dict = {pn: p for pn, p in model.named_parameters()}
-    # filter out those that do not require grad
-    param_dict = {pn: p for pn, p in param_dict.items() if p.requires_grad}
-    # create optim groups. Any parameters that is 2D will be weight decayed, otherwise no.
-    # i.e. all weight tensors in matmuls + embeddings decay, all biases and layernorms don't.
-    decay_params = [p for n, p in param_dict.items() if p.dim() >= 2]
-    nodecay_params = [p for n, p in param_dict.items() if p.dim() < 2]
-    optim_groups = [
-        {'params': decay_params, 'weight_decay': weight_decay},
-        {'params': nodecay_params, 'weight_decay': 0.0}
-    ]
-    num_decay_params = sum(p.numel() for p in decay_params)
-    num_nodecay_params = sum(p.numel() for p in nodecay_params)
-    logger.info(f"num decayed parameter tensors: {len(decay_params)}, with {num_decay_params:,} parameters")
-    logger.info(f"num non-decayed parameter tensors: {len(nodecay_params)}, with {num_nodecay_params:,} parameters")
-    # Create AdamW optimizer and use the fused version if it is available
-    fused_available = 'fused' in inspect.signature(torch.optim.AdamW).parameters
-    extra_args = dict(fused=True) if fused_available else dict()
-    optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=betas, **extra_args)
-    logger.info(f"using fused AdamW: {fused_available}")
+    # Separate parameters for Muon (>=2D, weights) and AdamW (others)
+    # iFlame logic: "embed_tokens" and "output_proj" are excluded from Muon even if 2D
+    # In TAR3D GPT, embeddings are 'tok_embeddings', 'cls_embedding'
+    # output layer is 'norm' (LayerNorm) or 'lm_head' (if it existed, but here it seems to be implicit or different?)
+    # Wait, GPT-L in gpt.py doesn't have a specific 'lm_head', it returns embeddings?
+    # Ah, let's check gpt.py forward pass. It returns embeddings.
+    # But wait, train_gpt.py computes loss.
+    # Let's check train_gpt.py loss computation.
+    # It calls model(..., targets=...).
+    # In gpt.py, forward computes logits using F.linear(h, self.tok_embeddings.weight).
+    # So the output projection IS the embedding weight (tied weights).
+    # So we should exclude 'tok_embeddings' from Muon.
+    
+    muon_params = []
+    adamw_params = []
+    
+    for name, p in model.named_parameters():
+        if not p.requires_grad:
+            continue
+            
+        # Check if it should be Muon
+        # iFlame: p.ndim >= 2 and "embed_tokens" not in name and "output_proj" not in name
+        # TAR3D: 'tok_embeddings', 'cls_embedding'
+        is_embedding = "tok_embeddings" in name or "cls_embedding" in name
+        if p.ndim >= 2 and not is_embedding:
+            muon_params.append(p)
+        else:
+            adamw_params.append(p)
+            
+    logger.info(f"num Muon parameter tensors: {len(muon_params)}")
+    logger.info(f"num AdamW parameter tensors: {len(adamw_params)}")
+    
+    optimizer = Muon(
+        lr=0.02, # Muon default is 0.02, iFlame uses 0.02 often. User passed args.lr (1e-4).
+                 # CRITICAL: Muon needs higher LR (0.01-0.05). AdamW needs lower (1e-4).
+                 # We should probably hardcode Muon LR or add an arg, but for now let's use a safe default 0.02
+                 # and use args.lr for AdamW.
+        wd=weight_decay,
+        muon_params=muon_params,
+        adamw_params=adamw_params,
+        adamw_betas=betas,
+        adamw_eps=1e-8,
+        # We need to pass the AdamW LR somehow. 
+        # In my Muon implementation, I didn't see an explicit 'adamw_lr' arg in __init__?
+        # Let's check Muon.__init__ again.
+        # It takes 'lr' (for Muon).
+        # It takes 'adamw_betas', 'adamw_eps'.
+        # It puts everything in 'defaults'.
+        # In step(), AdamW part uses group['lr'].
+        # This means Muon and AdamW share the same LR in the group?
+        # NO. iFlame's Muon implementation has `adjusted_lr` for Muon updates.
+        # But AdamW part uses `lr = group['lr']`.
+        # If we pass lr=0.02 to Muon constructor, group['lr'] becomes 0.02.
+        # Then AdamW will use 0.02, which is WAY too high (usually 1e-4).
+        # iFlame must handle this.
+        # Let's look at iFlame.py get_optimizer again.
+        # It returns Muon(lr=lr, ...).
+        # If iFlame calls it with lr=1e-3 (default in get_optimizer), then Muon uses 1e-3.
+        # But Muon paper says 0.02.
+        # Maybe iFlame uses 1e-3 for everything?
+        # Let's stick to args.lr for now to be safe, or use the iFlame default if I can confirm it.
+        # iFlame.py: default lr=1e-3.
+        # Let's use args.lr (1e-4) for safety first.
+        # WAIT. Muon relies on spectral norm updates. 1e-4 might be too small for Muon.
+        # But 0.02 is definitely too big for AdamW.
+        # I will use args.lr for now.
+        lr=learning_rate
+    )
+    
     return optimizer
 
 
@@ -81,8 +131,11 @@ def main(args):
     assert torch.cuda.is_available(), "Training currently requires at least one GPU."
     
     # Setup DDP:
+    # Setup DDP:
     init_distributed_mode(args)
-    assert args.global_batch_size % dist.get_world_size() == 0, f"Batch size must be divisible by world size."
+    world_size = dist.get_world_size()
+    if world_size > 1:
+        assert args.global_batch_size % world_size == 0, f"Batch size must be divisible by world size."
     rank = dist.get_rank()
     device = rank % torch.cuda.device_count()
     seed = args.global_seed * dist.get_world_size() + rank

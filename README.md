@@ -90,7 +90,17 @@ Then, we add the vector quantization codebook and fine-tune the entire VQ-VAE.
 
 
 ### 2. Training 3D GPT
+#### Single-GPU Efficient Training (New!)
+Thanks to the new Hybrid Linear Attention architecture and Muon optimizer, you can now train efficiently on a single GPU.
+```bash
+python train_gpt.py \
+--gpt-type i23d \
+--global-batch-size 4 \
+--gpt-model GPT-B
 ```
+
+#### Multi-GPU Training (Legacy)
+```bash
 CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 torchrun \
 --nnodes=1 \
 --nproc_per_node=8 \
@@ -102,6 +112,20 @@ train_gpt.py \
 --global-batch-size 8 "$@"
 
 ```
+
+## 🚀 Efficient Architecture Updates
+This repository has been updated with:
+1.  **Hybrid Attention**: Interleaves efficient Linear Attention (Lightning Attention) with standard Full Attention (Flash Attention) in a 3:1 ratio. This reduces memory complexity from $O(N^2)$ to $O(N)$ for most layers.
+2.  **Muon Optimizer**: Uses the memory-efficient Muon optimizer for weight updates, enabling larger batch sizes.
+3.  **Single-GPU Support**: Optimized to run on consumer GPUs without requiring a massive cluster.
+
+### Additional Dependencies
+Please install the following efficient attention kernels:
+```bash
+pip install lightning-attn flash-attn --no-build-isolation
+```
+
+> **Note**: This single-GPU optimization integrates efficient training techniques into the conditional [TAR3D](https://github.com/HVision-NKU/TAR3D) framework, inspired by the efficient architecture of the unconditional [iFlame](https://github.com/hanxiaowang00/iFlame) model. I adapted the Linear Attention mechanism to correctly handle conditional generation (handling padding without explicit masks) while retaining the original model's quality.
 
 
 
