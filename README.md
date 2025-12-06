@@ -8,6 +8,21 @@
 
 </div>
 
+
+## 🚀 Efficient Architecture Updates
+This repository has been updated with:
+1.  **Hybrid Attention**: Interleaves efficient Linear Attention (Lightning Attention) with standard Full Attention (Flash Attention) in a 3:1 ratio. This reduces memory complexity from $O(N^2)$ to $O(N)$ for most layers.
+2.  **Muon Optimizer**: Uses the memory-efficient Muon optimizer for weight updates, enabling larger batch sizes.
+3.  **Single-GPU Support**: Optimized to run on consumer GPUs without requiring a massive cluster.
+
+### Additional Dependencies
+Please install the following efficient attention kernels:
+```bash
+pip install lightning-attn flash-attn --no-build-isolation
+```
+
+> **Note**: This single-GPU optimization integrates efficient training techniques into the conditional [TAR3D](https://github.com/HVision-NKU/TAR3D) framework, inspired by the efficient architecture of the unconditional [iFlame](https://github.com/hanxiaowang00/iFlame) model. I adapted the Linear Attention mechanism to correctly handle conditional generation (handling padding without explicit masks) while retaining the original model's quality.
+
 ## 🚩 **Todo List**
 - [x] Source code of 3D VQVAE.
 - [x] Source code of 3D GPT.
@@ -112,20 +127,6 @@ train_gpt.py \
 --global-batch-size 8 "$@"
 
 ```
-
-## 🚀 Efficient Architecture Updates
-This repository has been updated with:
-1.  **Hybrid Attention**: Interleaves efficient Linear Attention (Lightning Attention) with standard Full Attention (Flash Attention) in a 3:1 ratio. This reduces memory complexity from $O(N^2)$ to $O(N)$ for most layers.
-2.  **Muon Optimizer**: Uses the memory-efficient Muon optimizer for weight updates, enabling larger batch sizes.
-3.  **Single-GPU Support**: Optimized to run on consumer GPUs without requiring a massive cluster.
-
-### Additional Dependencies
-Please install the following efficient attention kernels:
-```bash
-pip install lightning-attn flash-attn --no-build-isolation
-```
-
-> **Note**: This single-GPU optimization integrates efficient training techniques into the conditional [TAR3D](https://github.com/HVision-NKU/TAR3D) framework, inspired by the efficient architecture of the unconditional [iFlame](https://github.com/hanxiaowang00/iFlame) model. I adapted the Linear Attention mechanism to correctly handle conditional generation (handling padding without explicit masks) while retaining the original model's quality.
 
 
 
