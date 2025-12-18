@@ -107,6 +107,18 @@ class MultiheadFlashrope(nn.Module):
 
         return attn_output
 
+def apply_rotary_emb(x: torch.Tensor, freqs_cis: torch.Tensor):
+    # x: (bs, seq_len, n_head, head_dim)
+    # freqs_cis (seq_len, head_dim // 2, 2)
+    xshaped = x.float().reshape(*x.shape[:-1], -1, 2) # (bs, seq_len, n_head, head_dim//2, 2)
+    freqs_cis = freqs_cis.view(1, xshaped.size(1), 1, xshaped.size(3), 2) # (1, seq_len, 1, head_dim//2, 2)
+    x_out2 = torch.stack([
+            xshaped[..., 0] * freqs_cis[..., 0] - xshaped[..., 1] * freqs_cis[..., 1],
+            xshaped[..., 1] * freqs_cis[..., 0] + xshaped[..., 0] * freqs_cis[..., 1],
+    ], dim=-1)
+    x_out2 = x_out2.flatten(3)
+    return x_out2.type_as(x)
+
 class MultiheadFlashlinearrope(nn.Module):
     def __init__(self, embed_dim, num_heads):
         super().__init__()
@@ -118,13 +130,13 @@ class MultiheadFlashlinearrope(nn.Module):
         self.k_proj = nn.Linear(embed_dim, embed_dim, bias=False)
         self.v_proj = nn.Linear(embed_dim, embed_dim, bias=False)
         self.out_proj = nn.Linear(embed_dim, embed_dim, bias=False)
-        self.rotary = Rotary(self.head_dim)
+        # self.rotary = Rotary(self.head_dim) # Use external RoPE
         self.rms_norm = RMSNorm(embed_dim, eps=1e-5)
         
         slope_rate = _build_slope_tensor(self.num_heads)
         self.register_buffer("slope_rate", slope_rate, persistent=False)
 
-    def forward(self, x, causal=True):
+    def forward(self, x, freqs_cis=None, causal=True):
         bsz, seq_len, _ = x.size()
 
         q = self.q_proj(x)
@@ -136,7 +148,9 @@ class MultiheadFlashlinearrope(nn.Module):
         v = v.view(bsz, seq_len, self.num_heads, self.head_dim)
 
         # Apply RoPE
-        q, k = self.rotary(q), self.rotary(k)
+        if freqs_cis is not None:
+            q = apply_rotary_emb(q, freqs_cis)
+            k = apply_rotary_emb(k, freqs_cis)
         
         # Transpose for Lightning Attention: (B, H, N, D)
         q = q.transpose(1, 2)
